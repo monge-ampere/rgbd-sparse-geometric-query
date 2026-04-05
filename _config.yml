@@ -1,0 +1,5 @@
+title: RGB-D Sparse Geometric Query
+markdown: kramdown
+kramdown:
+  input: GFM
+  math_engine: mathjax
