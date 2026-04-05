@@ -1,14 +1,18 @@
----
-layout: default
-title: "从 RGB-D 标定到稀疏几何查询：一个未被正式写下来的 3D 视觉底层方案"
-date: 2026-04-05 20:00:00 +0800
-categories: [3d-vision, calibration, geometry]
----
+# 从 RGB-D 标定到稀疏几何查询
 
-# From RGB-D Calibration to Sparse Geometric Query: A Low-Level 3D Vision Scheme I Never Properly Wrote Down
+**A low-level 3D vision scheme for calibration, sparse cross-sensor mapping, and lightweight 3D recovery**
+
+这篇文章整理的是我在 2019–2020 年前后做过的一套 RGB-D 底层视觉方案。它不是一个已经被完整整理成论文或正式产品文档的成果；它更像一个在很短时间内做出来、后来没有继续展开，但核心问题其实写对了的原型。
+
+它真正有价值的地方，不在于“做了一个 RGB-D 标定模块”，而在于它把跨传感器点对应问题，从整幅图像的通用稠密映射，改写成了一个面向少量关键点的**稀疏几何查询问题**。
+
+> **核心思想**  
+> 给定 RGB 图上的一个关键点，不去生成整幅 RGB–Depth 映射场，而是先构造该点在三维中的视线，再在受限深度区间内生成候选三维点，把每个候选点投到深度相机，并用深度一致性来判断哪个假设成立。
+
+---
 
 > **English Abstract**  
-> This article reconstructs a low-level RGB-D vision scheme I built around 2019–2020 for calibration, cross-sensor point mapping, and lightweight 3D recovery. The key insight was that the practical task was not dense RGB–depth alignment over the entire image, but sparse mapping of a small number of RGB feature points into the depth image and then into 3D. Instead of relying on the vendor API for full-frame remapping, the scheme reformulated the problem as a task-specific geometric query: given one RGB feature point, generate a 3D viewing ray, sample along a constrained depth interval, project each 3D hypothesis into the depth camera, and validate it by depth consistency. Although the prototype was built quickly and never developed into a complete research artifact, it remains a representative example of a lesson I have reused many times later: once the geometric level of the problem is rewritten correctly, the solution can become both simpler and faster.
+> This article reconstructs a low-level RGB-D vision scheme I built around 2019–2020 for calibration, cross-sensor point mapping, and lightweight 3D recovery. The key insight was that the practical task was not dense RGB–depth alignment over the entire image, but sparse mapping of a small number of RGB feature points into the depth image and then into 3D. Instead of relying on the vendor API for full-frame remapping, the scheme reformulated the problem as a task-specific geometric query: given one RGB feature point, generate a 3D viewing ray, sample along a constrained depth interval, project each 3D hypothesis into the depth camera, and validate it by depth consistency.
 
 这篇文章整理的是我在 2019–2020 年前后做过的一套 RGB-D 底层视觉方案。严格说，它不是一个已经被完整整理成论文或正式产品文档的成果；它更像一个**在很短时间内做出来、后来没有继续展开，但核心问题其实写对了**的原型。
 
