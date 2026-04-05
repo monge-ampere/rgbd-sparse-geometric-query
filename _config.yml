@@ -2,5 +2,8 @@ title: RGB-D Sparse Geometric Query
 description: A low-level 3D vision scheme for calibration, sparse cross-sensor mapping, and lightweight 3D recovery
 theme: minima
 markdown: kramdown
-baseurl: "/rgbd-sparse-geometric-query"
+
 url: "https://monge-ampere.github.io"
+baseurl: "/rgbd-sparse-geometric-query"
+
+permalink: pretty
