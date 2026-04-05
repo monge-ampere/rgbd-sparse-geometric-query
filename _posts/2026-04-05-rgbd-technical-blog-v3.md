@@ -1,551 +1,466 @@
 ---
 layout: post
-title: "从 RGB-D 标定到稀疏几何查询：一个未充分展开的底层 3D 视觉方案"
-date: 2026-04-05 20:30:00 +0800
+title: "从 RGB-D 标定到稀疏几何查询：一个未被正式写下来的 3D 视觉底层方案"
+date: 2026-04-05 20:00:00 +0800
 categories: [3d-vision, calibration, geometry]
-tags: [RGB-D, calibration, depth-camera, geometric-query, 3d-reconstruction]
-math: true
 ---
 
-# From RGB-D Calibration to Sparse Geometric Query: A Low-Level 3D Vision Scheme I Never Fully Developed
+# From RGB-D Calibration to Sparse Geometric Query: A Low-Level 3D Vision Scheme I Never Properly Wrote Down
 
 > **English Abstract**  
-> This post reconstructs a low-level RGB-D vision scheme that I built around 2019 for calibration, cross-sensor mapping, and 3D recovery. The key point is that I did **not** treat RGB-to-depth alignment as a dense full-frame mapping problem. Instead, for the actual industrial task, I reformulated it as a **sparse geometric query problem**: given a small number of RGB feature points, recover their corresponding depth-image locations and 3D coordinates efficiently by searching along a calibrated viewing ray and validating depth consistency. Although the work was implemented quickly and never expanded into a full project or paper, it remains a representative example of a method I have repeatedly used later: when an existing API solves the wrong problem, the right move is often not to patch the API, but to rewrite the task at the correct geometric level.
+> This article reconstructs a low-level RGB-D vision scheme I built around 2019–2020 for calibration, cross-sensor point mapping, and lightweight 3D recovery. The key insight was that the practical task was not dense RGB–depth alignment over the entire image, but sparse mapping of a small number of RGB feature points into the depth image and then into 3D. Instead of relying on the vendor API for full-frame remapping, the scheme reformulated the problem as a task-specific geometric query: given one RGB feature point, generate a 3D viewing ray, sample along a constrained depth interval, project each 3D hypothesis into the depth camera, and validate it by depth consistency. Although the prototype was built quickly and never developed into a complete research artifact, it remains a representative example of a lesson I have reused many times later: once the geometric level of the problem is rewritten correctly, the solution can become both simpler and faster.
 
-这篇文章整理的是我在 2019 年前后做过的一套 RGB-D 底层视觉方案。它的原始形态并不完整：实现时间很短，大约一周左右，后来也没有继续展开成正式项目或论文。但现在回头看，它仍然值得写下来，因为它代表了一种我后来反复使用的方法：
+这篇文章整理的是我在 2019–2020 年前后做过的一套 RGB-D 底层视觉方案。严格说，它不是一个已经被完整整理成论文或正式产品文档的成果；它更像一个**在很短时间内做出来、后来没有继续展开，但核心问题其实写对了**的原型。
 
-> **当现成 API 的问题定义并不真正匹配任务时，关键并不是围绕 API 修修补补，而是把问题改写成更贴合任务本体的几何问题。**
+如果只从功能描述上看，它不过是“RGB-D 标定 + 点映射 + 三维恢复”。但现在回头看，我觉得它真正有价值的地方不在功能罗列，而在于它体现了一种后来我反复使用的方法：
 
-这套方案的核心不是“做一张 RGB-D 对齐图”，而是：
+> **当现成 API 的问题定义与任务本体并不一致时，继续围绕 API 修补往往不是正路。更重要的是回到几何本身，把问题改写成更贴合任务的结构。**
 
-- 建立 RGB、Depth、IR 之间的几何关系；
-- 完成跨传感器标定与三维恢复；
-- 把在线问题写成 **少量 RGB 特征点到深度图的稀疏几何查询**；
-- 在任务需要时进一步结合 IR / 双目恢复更稳的 3D 参数。
+这套方案就是一个很具体的例子。它不是继续沿着厂商提供的整幅 RGB–Depth 稠密映射接口往前堆，而是把问题重写成了一个**面向少量关键点的稀疏几何查询问题**。
 
 ---
 
-## 1. 问题本体：我要的不是整幅稠密映射，而是少量关键点的快速 3D 恢复
+## 1. 任务本体到底是什么
 
-很多 RGB-D 设备都提供从 RGB 到 Depth、或从 Depth 到 RGB 的官方映射 API。表面上看，这似乎已经足够；但如果进一步看工业任务，就会发现它解决的并不一定是你真正关心的问题。
+在 RGB-D 项目里，一个最自然的说法是：“需要 RGB 图和深度图对齐。”  
+但这个说法虽然常见，却不一定准确。
 
-对很多场景而言，真正需要的不是：
+对于很多工业场景，真正关心的往往不是“整幅 RGB 图和整幅 D 图都精确稠密对应”，而是下面这类更具体的问题：
 
-\[
-\text{build a dense correspondence field over the whole image}
-\]
+- RGB 图上的某几个关键点，在深度图上到底对应哪里；
+- 这些点的三维坐标能否稳定恢复；
+- 后续能否与 IR、双目或其他几何线索融合，得到更稳的三维参数。
 
-而是：
+也就是说，任务本体其实更接近：
 
-\[
-\text{given a few RGB feature points, recover their depth correspondences and 3D coordinates quickly.}
-\]
+> **给定 RGB 图上的少量关键点，快速而稳定地找到其在深度图中的对应位置，并恢复其三维坐标。**
 
-也就是说，任务本体是一个 **稀疏关键点查询问题**，而不是一个 **整图稠密映射问题**。
+这个表述看似只是措辞变化，实际上已经决定了算法路线。
 
-如果问题本体本来就是稀疏的，那么先生成整幅 RGB-D 对齐场，再从里面取几个点，往往是明显的过度计算。
+如果问题是“整幅图稠密映射”，那么自然会去找 full-frame remapping。  
+如果问题是“少量点的快速恢复”，那么更自然的路线其实是**稀疏、几何化、按需求值**。
 
 ---
 
 ## 2. 为什么我没有直接采用厂商 API
 
-当时使用的是 PICO Zense 相机。官方 SDK 提供了 RGB 与深度图互映射 API。其思路大体可以概括为：
+当时 PICO Zense 已经提供了 RGB 与深度图之间的映射 API。设计文档里对它的描述很清楚：它的实现机理大致是把深度图经由相对位姿提升到三维，再投影到 RGB 图，然后再把 RGB 中的点拉回深度图完成互映射。
 
-1. 将深度图像素恢复到三维空间；
-2. 通过相对位姿变换到另一相机坐标系；
-3. 再投影到目标像平面；
-4. 必要时再做一次反向拉回，完成对应建立。
+下面这张图来自当时保留下来的设计文档：
 
-如果写成符号形式，它更接近：
+![API mapping result vs. our mapping result]({{ "/assets/images/rgbd-fig1-api-vs-ours.png" | relative_url }})
 
-\[
-(u_d, v_d, z_d)
-\rightarrow X_d
-\rightarrow X_{rgb}
-\rightarrow (u_{rgb}, v_{rgb})
-\rightarrow \text{dense mapping field}.
-\]
+*图 1：RGB 映射到深度图的效果对比。左上为厂商 API 映射效果，左下为当时原型算法的映射效果，右上为 RGB 图，右下为深度图。深度缺失与边界不稳定会直接影响通用 API 的映射质量。*
 
-这条链条当然通用，但也有三个直接问题：
+如果目标真的是“整幅 RGB–Depth 稠密对齐”，这种 API 是自然的。  
+但对我的任务来说，它至少有三个问题：
 
-### 2.1 它是整图思维，不是关键点思维
+1. **它解决的是整幅图的通用稠密映射，不是少量关键点的稀疏查询。**
+2. **它的质量高度依赖深度图本身的稳定性，而深度图在真实场景中经常存在边界跳变、孔洞和信息丢失。**
+3. **为了得到几个点的对应关系，先计算整幅图映射场，属于明显的过度计算。**
 
-API 更接近在做
+因此，当时最关键的判断其实不是“API 好不好”，而是：
 
-\[
-\Omega_{rgb} \leftrightarrow \Omega_d
-\]
+> **API 解决的不是我要解决的问题。**
 
-上的稠密场构造，而我的任务只关心少量点
-
-\[
-\{p_i^{rgb}\}_{i=1}^n.
-\]
-
-### 2.2 它过度依赖深度图自身的稳定性
-
-如果深度图在边界、遮挡、反光、低纹理区域出现缺失或不稳定，那么通用映射场本身就会受到影响。
-
-### 2.3 它在计算上是“先做大，再取小”
-
-为了得到少量点的答案，先做整图映射，这在任务上并不经济。
-
-所以这里的关键判断不是“API 好不好”，而是：
-
-> **API 解的是一个通用稠密问题，而我真正关心的是一个任务导向的稀疏问题。**
+这句话后来对我影响很大。很多系统级问题，并不是缺少工具，而是**工具的抽象层级与任务抽象层级并不相同**。
 
 ---
 
-## 3. 几何基础：RGB、Depth、IR 本来就应该放在同一条几何链里
+## 3. 几何模型：RGB、D、IR 不是三张图，而是一条几何链
 
-这套方案的基础不是某个特定 SDK，而是一个比较标准的多传感器几何模型。
+这套方案的基础并不神秘，本质上还是一个标准的多传感器相机模型：
 
-### 3.1 RGB 相机模型
+- RGB 相机有自己的内参与畸变；
+- D 相机也有自己的内参与畸变；
+- RGB 与 D 之间存在相对位姿；
+- IR 与 D 在设备内部通常具有更紧的几何关联；
+- 如果 IR 更适合标定，那么完全可以走 RGB–IR 这条更稳的链，再间接约束 D。
 
-RGB 相机采用针孔模型。设三维点在 RGB 相机坐标系下为
+原始文档中的几何示意图如下：
 
-\[
-X_{rgb} = (X,Y,Z)^\top,
-\]
+![RGB-D camera geometry]({{ "/assets/images/rgbd-fig3-camera-geometry.png" | relative_url }})
 
-则其归一化像平面坐标为
+*图 2：RGB-D 相机的几何模型示意。RGB、D 与 IR 不是孤立输出，而是共同处在一条跨传感器几何链中。*
 
-\[
-x_n = \frac{X}{Z}, \qquad y_n = \frac{Y}{Z}.
-\]
+### 3.1 针孔模型
 
-若内参矩阵记为
+对于 RGB 相机，采用标准针孔模型：
 
-\[
-K_{rgb} =
+$$
+\lambda
 \begin{bmatrix}
- f_x & 0 & c_x \\
+ u \\
+ v \\
+ 1
+\end{bmatrix}
+=
+K
+\begin{bmatrix}
+R & t
+\end{bmatrix}
+\begin{bmatrix}
+X \\
+Y \\
+Z \\
+1
+\end{bmatrix},
+$$
+
+其中内参矩阵为
+
+$$
+K=
+\begin{bmatrix}
+ f_x & s & c_x \\
  0 & f_y & c_y \\
  0 & 0 & 1
-\end{bmatrix},
-\]
-
-则理想无畸变投影为
-
-\[
-\tilde p_{rgb} = K_{rgb}
-\begin{bmatrix}
- x_n \\
- y_n \\
- 1
 \end{bmatrix}.
-\]
+$$
 
-### 3.2 径向畸变模型
+在代码里，这对应于 `rgbCamera.param` 与 `rgbCamera.antiParam` 的初始化，以及后续通过 `MultMatrix` 完成的反投影与投影操作。
 
-代码里采用的是简化径向畸变模型。设
+### 3.2 径向畸变
 
-\[
-r^2 = x_n^2 + y_n^2,
-\]
+原型代码里采用的是一个简化的径向畸变模型。若归一化像平面点为 $(x,y)$，则定义
 
-畸变因子写成
+$$
+r^2=x^2+y^2,
+$$
 
-\[
-\delta(r) = k_1 r^2 + k_2 r^4 + k_3 r^6.
-\]
+并令
 
-则从理想点到实际像点的近似关系可写成
+$$
+\delta(r)=k_1 r^2 + k_2 r^4 + k_3 r^6.
+$$
 
-\[
-u = u_0 + (u_0-c_x)\,\delta(r),
-\qquad
-v = v_0 + (v_0-c_y)\,\delta(r),
-\]
+于是理想到实际像点的映射可写成
 
-其中 \((u_0,v_0)\) 是无畸变投影后的像素坐标。
+$$
+\begin{aligned}
+ u &= u_0 + (u_0-c_x)\,\delta(r), \\
+ v &= v_0 + (v_0-c_y)\,\delta(r),
+\end{aligned}
+$$
 
-严格地说，逆畸变一般需要迭代求解；但在这份快速原型中，我采用了足够简单且可运行的近似处理。这种取舍本身也反映了当时的工程目标：**不是把局部模型做到最精，而是让整条几何链在短时间内可运行、可验证。**
+其中 $(u_0,v_0)$ 是不带畸变的像点。
 
-### 3.3 RGB 与 D 的外参关系
+代码中的 `ideal2real(...)` 与 `real2ideal(...)` 正是在做这层处理。它不是最复杂的反畸变实现，但足以说明：**整套方法是沿真实几何链条算的，而不是拿二维经验映射硬凑。**
 
-设三维点在 RGB 相机坐标系和 D 相机坐标系中的坐标分别为 \(X_{rgb}\) 与 \(X_d\)，则二者满足刚体变换：
+### 3.3 RGB 到 D 的刚体关系
 
-\[
-X_d = R X_{rgb} + t,
-\]
+设 RGB 相机坐标系中的点为 $p_{rgb}$，D 相机坐标系中的对应点为 $p_d$，则有
 
-其中
+$$
+p_d = R_{d\leftarrow rgb} \, p_{rgb} + t_{d\leftarrow rgb}.
+$$
 
-\[
-R \in SO(3), \qquad t \in \mathbb{R}^3.
-\]
+这正对应 `relaMatrix` 和 `relaTrans`；其逆变换对应 `antiRelaMatrix` 和 `antiRelaTrans`。
 
-反变换则为
+所以一旦跨传感器几何关系被标定出来，所谓“RGB 点映到深度图”其实就不再是图像搬运，而是：
 
-\[
-X_{rgb} = R^{-1}(X_d - t).
-\]
-
-代码中分别保留了 `relaMatrix`, `relaTrans` 以及它们的逆。
-
-### 3.4 为什么 IR 很重要
-
-Depth 图像往往不适合直接拿来做棋盘格角点观测，而 IR 图像常常更自然地呈现标定板。因此在实际方案里，我并没有执着于“必须硬从 RGB-D 直接标定”，而是明确把 RGB–IR 双目标定看成更成熟、也更稳的入口，再通过 IR 与 D 的天然关联间接约束 D 相关参数。
-
-这个判断在今天回头看仍然是对的：
-
-> **不是所有传感器通道都应该被一视同仁地使用。几何上更适合做观测入口的通道，往往应该优先承担标定任务。**
+> **把 RGB 像点放回三维，再通过跨传感器坐标变换投到 D 相机。**
 
 ---
 
-## 4. 标定链条：先得到可靠几何关系，再谈在线查询
+## 4. 标定链条：为什么除了 RGB–D，还要认真考虑 RGB–IR
 
-### 4.1 RGB 相机内参
+当时方案里并不是只设计了一条路径，而是留了几种层次不同的做法。
 
-RGB 相机内参可通过常规棋盘格方法拟合，即在多幅平面标定板图像上估计单应关系，再恢复内参与外参。若以张正友标定法的语言表达，就是从
+### 4.1 RGB–D 联合标定
 
-\[
-H_i = K [r_1^{(i)}\; r_2^{(i)}\; t^{(i)}]
-\]
+最直接的思路，是用棋盘格、平面模型和对应点，拟合：
 
-中恢复内参矩阵 \(K\)。
+- RGB 相机内参；
+- D 相机内参；
+- RGB 与 D 的相对位姿。
 
-### 4.2 D 相机相关参数
+对应的初始化与细优化示意如下：
 
-对于深度相机，直接在深度图上提取高质量棋盘格角点并不自然，因此更可行的路线通常是：
+![Initialization model]({{ "/assets/images/rgbd-fig4-initialization-model.png" | relative_url }})
 
-- 利用对应点或平面模型做初始化；
-- 再通过几何一致性做联合优化。
+*图 3：RGB–D 联合标定的初始化示意。重点不是一开始追求极致精度，而是先建立一个足够可靠的几何起点。*
 
-### 4.3 平面模型为何合适
+![Calibration board and plane reconstruction scene]({{ "/assets/images/rgbd-fig5-plane-calibration-board.png" | relative_url }})
 
-设标定板所在平面为
+*图 4：平面模型与标定场景示意。对于深度相机而言，平面通常比边界跳变强烈的对象更适合作为几何参照。*
 
-\[
-\Pi: n^\top X + d = 0,
-\]
+当时我比较明确的判断是：**深度图并不天然适合直接当作高精度棋盘格角点检测的入口。**  
+它会有孔洞、跳变和不稳定区域，所以如果直接在 Depth 图上强行做角点级初始化，往往很吃力。
 
-其中 \(n\) 为单位法向量。平面之所以合适，是因为：
+因此在设计文档里，平面模型被放在了比较优先的位置。原因不复杂：
 
-1. 它是最简单的全局几何对象；
-2. 它避免了深度边界跳变对观测稳定性的干扰；
-3. 它为后续最小二乘或 LM 优化提供了自然约束。
+- 平面是最简单的流形参照；
+- 深度图对平面通常比对边界跳变更稳定；
+- 平面也更适合后续做几何残差和全局一致性约束。
 
-### 4.4 初始化与细化
+### 4.2 RGB–IR 双目标定
 
-当时方案的思路并不是“一上来就全量大优化”，而是分成两步：
+现在回头看，我觉得当时方案里更成熟的一笔，其实是没有执着于“必须直接搞定 RGB–D”。
 
-1. 先得到一个足够可靠的初始化；
-2. 再通过联合残差做细化。
+因为 IR 图像在很多设备上，比 Depth 图更自然地呈现棋盘格角点。  
+于是如果 IR 与 D 在几何上天然绑定，那么就完全可以转而走 RGB–IR 双目标定，再间接约束 D。
 
-这一步在工程里很重要。因为如果初始化错得太远，后面的非线性优化往往并不会帮你，而只会把问题进一步带偏。
+相关图示如下：
+
+![IR chessboard and Zense chessboard]({{ "/assets/images/rgbd-fig6-ir-chessboard-zense.png" | relative_url }})
+
+*图 5：IR 图像中的棋盘格示意。对于这类设备，IR 常常比深度图更适合作为标定入口。*
+
+![IR image vs RGB image of calibration board]({{ "/assets/images/rgbd-fig7-ir-vs-rgb-board.jpg" | relative_url }})
+
+*图 6：IR 图与 RGB 图中的标定板示意。把 RGB–IR 视作更稳的双目标定路径，很多时候比直接在深度图上强行找角点更自然。*
+
+这件事本身也很能说明问题：
+
+> **在底层视觉系统里，好的方案不一定是“最直观”的链条，而是“最稳定的几何中介”。**
 
 ---
 
-## 5. 真正的核心：把在线映射写成单条射线上的一维几何查询
+## 5. 核心转折：把“映射问题”改写成“几何查询问题”
 
-如果这套东西只有标定，它还只是一个常规 3D 视觉模块。真正让我现在回头看仍然觉得漂亮的，是在线阶段的问题改写。
+如果这套方案只有标定，它还只是一个标准 3D 视觉模块。它真正让我现在回头看仍然觉得漂亮的，是在线映射部分。
 
-### 5.1 输入不是整幅图，而是一个 RGB 点
+### 5.1 问题的重新表述
 
-设 RGB 图像中一个关键点为
+厂商 API 想做的是：
 
-\[
-p^{rgb} = (u,v,1)^\top.
-\]
+> **建立整幅 RGB 与 D 之间的通用稠密对应关系。**
 
-首先对其做近似逆畸变，得到理想像点，再左乘逆内参得到归一化视线方向：
+而我真正想做的是：
 
-\[
-\hat x = K_{rgb}^{-1} \, p^{rgb}_{ideal}.
-\]
+> **给定 RGB 上一个关键点，快速找到它在 D 图上的对应位置以及三维坐标。**
 
-于是从 RGB 光心出发可以得到一条三维射线
+于是在线阶段的任务不再是“生成一张映射场”，而是：
 
-\[
-\ell(s) = O_{rgb} + s\,\hat d,
-\qquad s>0.
-\]
+1. 从一个 RGB 像点出发，生成一条 3D 视线；
+2. 在工作深度范围内沿这条视线产生候选三维点；
+3. 把每个候选点投到 D 相机；
+4. 检查深度图是否支持这个几何假设；
+5. 一旦支持，就返回对应位置与三维坐标。
 
-代码里这一部分对应的是：
+这已经不是 remapping，而更像一个 **task-specific sparse geometric query**。
 
-- `real2ideal(...)`
-- `antiParam * rgbIdealPoint`
-- `getStraightLine(...)`
+### 5.2 反投影：从像点到射线
 
-### 5.2 只在工作深度区间上采样
+给定 RGB 像点
 
-与其在整张深度图甚至整个 3D 空间里找候选，不如直接利用任务先验，把搜索限制在
+$$
+p_{rgb} = (u,v,1)^\top,
+$$
 
-\[
-s \in [z_{near}, z_{far}].
-\]
+先做反畸变，再乘逆内参，得到归一化像平面方向：
 
-于是在线采样问题变成
+$$
+\tilde p_{rgb}=K_{rgb}^{-1} p_{rgb}^{(undist)}.
+$$
 
-\[
-X_s = \ell(s), \qquad s = z_{near}, z_{near}+\Delta s, \dots, z_{far}.
-\]
+于是 RGB 相机中的视线可写成
 
-也就是说，原来的二维 / 三维全局问题被压成了一个单变量搜索问题。
+$$
+\ell(s)=o_{rgb}+\alpha(s)\,n_{rgb},
+$$
 
-### 5.3 将候选点变换到 D 相机并投影
+其中 $o_{rgb}$ 为 RGB 光心，$n_{rgb}$ 为视线方向。
 
-每一个候选点 \(X_s\) 在 RGB 相机坐标系下确定后，可变换到 D 相机坐标系：
+在代码里，这对应：
 
-\[
-X_s^{(d)} = R X_s + t.
-\]
+- `real2ideal(rgbIdealfPoint, rgbPoint, &rgbCamera)`
+- `antiParam * rgbIdealfPoint -> rgbPhotoPoint`
+- `getStraightLine(ray.n, ray.point, origin, rgbPhotoPoint)`
 
-再做归一化投影：
+`getStraightLine(...)` 与 `getZPoint(...)` 这两个函数虽然简单，却非常关键：它们说明在线搜索不是在 2D 图像里乱找，而是**在单条三维视线的深度区间内做一维搜索**。
 
-\[
-(x_s^{(d)}, y_s^{(d)}) = \left(\frac{X_s^{(d)}}{Z_s^{(d)}}, \frac{Y_s^{(d)}}{Z_s^{(d)}}\right),
-\]
+### 5.3 候选点投到 D 相机
 
-并通过 D 相机内参和畸变得到深度图像素位置
+对每个候选点 $X(s)$，通过刚体变换送到 D 相机坐标系：
 
-\[
-p_s^{(d)} = (u_s^{(d)}, v_s^{(d)}).
-\]
+$$
+X_d(s)=R_{d\leftarrow rgb} X(s)+t_{d\leftarrow rgb}.
+$$
 
-代码里这一段主要对应：
+再通过 D 相机投影模型得到其在 D 图像中的候选像素：
 
-- `linearTransform(...)`
-- `getStraightLine(...)`（在 D 相机坐标系中构造相关视线）
-- `getZPoint(...)`
-- `ideal2real(...)`
+$$
+p_d(s) = \Pi_d(X_d(s)).
+$$
 
-### 5.4 用深度图只做一件事：验证这个候选是否成立
+在代码里，这对应：
 
-这一部分是我认为最关键的地方。
+- `linearTransform(temp, sample_point, relaMatrix, relaTrans)`
+- `getStraightLine(depth_ray.n, depth_ray.point, relaSample, relaDOpticCenter)`
+- `getZPoint(dIdealPoint, depth_ray, 1)`
+- `ideal2real(dRealPoint, dIdealPoint, &dCamera)`
 
-传统想法可能是：
+从现代代码审美看，这条链可以写得更紧凑；但从几何含义上，它非常明确：
 
-> 先把 RGB 和 D 做完整映射，再建立对应关系。
+> **每个 RGB 候选点都被重新投成 D 相机中的一个像素假设。**
 
-而我的想法是：
+### 5.4 深度一致性验证
 
-> 候选 3D 点已经由 RGB 视线给出来了，深度图只需要判断这个候选是否与当前观测一致。
+设候选点到 D 光心的预测距离为
 
-设从 D 光心到候选点的几何距离为
+$$
+d_{pred}(s)=\|X_d(s)-o_d\|,
+$$
 
-\[
-d_{geom}(s) = \|X_s^{(d)} - O_d\|_2.
-\]
+深度图在对应像素处读出的实测深度为
 
-从深度图像素 \(p_s^{(d)}\) 读取深度值，记为
+$$
+d_{obs}(s).
+$$
 
-\[
-d_{cam}(s).
-\]
+原型代码里使用了一个非常直接的几何一致性残差：
 
-则可以构造一个简单的一致性残差：
+$$
+\varepsilon(s)=d_{pred}(s) - \big(a\,d_{obs}(s)+b\big),
+$$
 
-\[
-r(s) = d_{geom}(s) - (a\,d_{cam}(s) + b).
-\]
+其中 $a,b$ 对应代码里的 `dCoeff[0], dCoeff[1]`。  
+若
 
-代码里对应的是：
+$$
+0<\varepsilon(s)<\tau,
+$$
+
+则认为这个候选点与深度观测一致，直接返回。
+
+代码中的核心逻辑其实就落在下面这几步：
 
 ```cpp
-confidenceDegree = actual_dist - dCoeff[0] * camera_dist - dCoeff[1];
+for (double s = zRange[0]; s < zRange[1]; s += sampleInterval)
+{
+    getZPoint(sample_point, ray, s);
+    actual_dist = EuclidDist(relaDOpticCenter, sample_point, 3);
+    linearTransform(temp, sample_point, relaMatrix, relaTrans);
+    // ... project to depth camera ...
+    camera_dist = (double)data;
+    confidenceDegree = actual_dist - a * camera_dist - b;
+    if (confidenceDegree < threshold && confidenceDegree > 0)
+    {
+        // accept and return
+        break;
+    }
+}
 ```
 
-其中 \(a,b\) 对应于深度尺度修正参数。
+因此，它真正做的不是“先重建整张 3D 场景，再去找点”，而是：
 
-一旦某个候选满足
+> **给定一个 RGB 点，在一条视线上连续提出 3D 假设，并让深度图来验证哪个假设成立。**
 
-\[
-0 < r(s) < \tau,
-\]
-
-就认为这个候选在几何上与深度图观测足够一致，直接返回：
-
-\[
-X^* = X_{s^*}, \qquad p_d^* = p_{s^*}^{(d)}.
-\]
-
-这就是整套在线查询的本质。
+这是一种很典型的 **hypothesis generation + sensor validation** 结构。
 
 ---
 
-## 6. 这其实不是“映射算法”，而是“假设验证算法”
+## 6. 为什么它会比整图 API 快很多
 
-现在回头看，我更愿意把它叫做：
+现在回头看，这个速度优势其实不神秘，关键有四条。
 
-> **面向 RGB 关键点的快速三维假设验证器**
+### 6.1 稠密问题变成了稀疏问题
 
-而不是简单地叫“RGB-D 映射”。
+厂商 API 解决的是 full-frame dense mapping；  
+这套原型解决的是 one-point sparse query。
 
-因为它真正做的不是建立一张完整映射表，而是：
+两者复杂度层级本来就不同。
 
-1. 由 RGB 点生成一条几何假设轨迹；
-2. 由深度图对每个候选点做观测一致性验证；
-3. 一旦找到满足条件的候选，立即输出三维坐标与深度图对应点。
+### 6.2 搜索空间被压缩成一维
 
-从这个角度看，它更像：
+不是在整张深度图上找，不是在整个 3D 空间里暴力找，而是只在一条视线的深度区间内采样。  
+若采样步长为 $\Delta z$，则在线搜索复杂度近似为
 
-\[
-\text{RGB point} \Rightarrow \text{3D hypothesis family} \Rightarrow \text{depth validation}.
-\]
+$$
+O\!\left(\frac{z_{far}-z_{near}}{\Delta z}\right).
+$$
 
-这比“整图对齐”更贴近任务，也更节省计算。
+这比 full-frame remapping 的代价轻得多。
 
----
+### 6.3 每个样本只做常数级计算
 
-## 7. 为什么它比厂商 API 快
-
-现在可以比较明确地把原因拆开说。
-
-### 7.1 搜索空间被降成 1D
-
-如果官方 API 做的是整图级对应建立，那么其在线代价更接近：
-
-\[
-O(HW)
-\]
-
-或至少与整图大小相关。
-
-而我的算法对单个关键点的代价更接近：
-
-\[
-O\left(\frac{z_{far}-z_{near}}{\Delta s}\right).
-\]
-
-这不是常数优化，而是问题维度本身降了。
-
-### 7.2 每一步只做常数级运算
-
-对每个候选样本，主要代价只有：
+每一步只包含：
 
 - 若干 3×3 线性变换；
 - 一次投影；
-- 一次深度图读数；
-- 一次残差判断。
+- 一次深度读取；
+- 一次残差比较。
 
-没有整图重采样，没有大规模插值，没有整图回拉。
+没有整幅重采样、没有稠密映射缓存、没有整图回拉。
 
-### 7.3 深度区间先验直接压缩了候选数
+### 6.4 有早停
 
-若工作距离已知，则可直接设置
+只要遇到第一个几何一致的候选点就直接返回，因此平均代价往往低于最坏代价。
 
-\[
-[z_{near}, z_{far}]
-\]
+所以这套方法快，不是因为我在 C++ 层面用了什么特别神奇的技巧，而是因为：
 
-而不在无关深度上浪费代价。
-
-### 7.4 具备早停
-
-一旦第一个候选满足条件，算法立即终止。于是平均复杂度通常低于最坏复杂度。
-
-所以这套算法快，并不是因为“C++ 写得更猛”，而是因为：
-
-> **我没有在解和官方 API 同一个问题。**
+> **问题被改写成了一个更低维、更受约束、与任务真正一致的几何求值过程。**
 
 ---
 
-## 8. 它的工程边界：为什么我说它是一个短期原型，而不是完整体系
+## 7. 代码层面的几个注记
 
-这套东西虽然有价值，但我并不想把它说成一个已经完全打磨成熟的体系。它有明显的原型特征。
+既然这是一篇技术博客，有些代码层面的边界也应该说清楚。
 
-### 8.1 它优先追求快速可用，而不是全局最优
+### 7.1 它是原型代码，不是整理后的展示代码
 
-代码里一旦遇到第一个满足阈值的候选就 `break`。这说明它采用的是 **first-hit** 逻辑，而不是继续扫完整个区间去找全局最优解。
+这套原型当时做得很快，后来也没有继续展开，因此代码明显带有工程原型痕迹，而不是为发表或展示精修过的版本。
 
-也就是说，它更像：
+例如：
 
-\[
-\text{sufficiently good and fast}
-\]
+- 有些资源释放并不完整；
+- 某些参数和阈值是非常直接的工程设置；
+- `first-hit` 的返回策略强调“快速可用”，不是全局最优；
+- 某些基础函数从今天看可以写得更规整。
 
-而不是
+### 7.2 关于深度类型的一处疑点
 
-\[
-\text{globally optimal and fully analyzed}.
-\]
+从代码字面看，有一处值得特别留意：
 
-### 8.2 它依赖参数与工作带先验
+```cpp
+uchar data = dMat16.at<uint16_t>(dRealPoint[1], dRealPoint[0]);
+```
 
-算法效果依赖于：
+如果 `dMat16` 真的是 `CV_16UC1` 的原始深度图，那么这里按字面会发生 16 位到 8 位的截断。  
+因此这里更合理的写法应当是：
 
-- 标定参数是否足够准；
-- `nearZ, farZ` 是否设得合适；
-- 采样间隔 \(\Delta s\) 是否合适；
-- 残差阈值 \(\tau\) 是否能区分真解与伪解。
+```cpp
+uint16_t data = dMat16.at<uint16_t>(dRealPoint[1], dRealPoint[0]);
+```
 
-这也解释了为什么它更像一个 **任务专用求解器**，而不是一个无条件通吃的通用 API。
-
-### 8.3 代码层面也带有明显原型痕迹
-
-比如在我保留下来的版本里，读取 16 位深度值的代码写法就存在可疑之处；从工程直觉看，当年的现场可运行版本大概率做过修正，但现在留下来的代码并不是最终整理过的展示版。
-
-不过这恰恰说明了它的真实位置：
-
-> **它首先是一个在很短时间内针对任务建立起来的底层原型，而不是一套为了发表或展示而精修过的“作品集工程”。**
+我现在已经无法完全确认这是贴代码时的笔误、某个阶段版本差异，还是当时在线分支里对深度做过另外的缩放处理。  
+但把这一点写出来反而更好，因为它说明：**我现在整理它，不是为了把它包装成完美作品，而是把一条真正有价值的几何路线说清楚。**
 
 ---
 
-## 9. 这件事后来对我真正重要的启发
+## 8. 这件事后来给我留下的真正启发
 
-现在回头看，这个项目真正重要的，不只是“做出了一个比 API 更快的 RGB-D 映射方案”。更重要的是，它再次验证了一个我后来越来越相信的判断：
+现在回头看，这个项目对我真正重要的，不是“做出了一个比 API 更快的 RGB–D 点映射原型”，而是它再次证明了一件我后来越来越相信的事：
 
-> **很多视觉问题的关键，不在于有没有现成工具，而在于你是否抓住了问题真正的几何形态。**
+> **很多视觉问题的关键，不在于有没有现成工具，而在于是否抓住了问题真正的几何形态。**
 
-如果问题本体是：
+如果问题本来是一个“关键点稀疏映射与三维恢复”问题，那么沿着整图稠密 API 修修补补，永远不如把它重新写成一条视线上的几何一致性查询来得自然。
 
-\[
-\text{few-point sparse mapping + 3D recovery}
-\]
+这也是为什么后来我越来越倾向于从结构、几何和表示空间出发去组织问题，而不是停留在位图层和接口层面。  
+从这个意义上说，这个原型虽然短、虽然没有继续展开，却已经很清楚地露出了我后来很多工作的同一条方法论线索：
 
-那么沿着
-
-\[
-\text{full-frame dense remapping}
-\]
-
-这条路继续补丁式修修补补，往往永远不如把它重写成
-
-\[
-\text{ray-wise geometric consistency query}
-\]
-
-来得自然。
-
-这也是为什么我后来越来越倾向于：
-
-- 先找结构化几何中介；
-- 再在这个中介里做低维、可控、可验证的求解；
-- 而不是直接停留在像素层或接口层解决问题。
-
-从今天回头看，这个很短时间内做出来、后来也没有继续展开的 RGB-D 原型，其实已经把这种方法论露出来了。
+- 先找一个更合适的几何中介；
+- 把问题压到更低维、更可控的表示里；
+- 再在那个结构里做求值、拟合或优化。
 
 ---
 
-## 10. 结尾：如果不把它写下来，它就真的只剩零散代码了
+## 9. 结尾：如果不把这类工作写下来，它就真的会散掉
 
-这套 RGB-D 方案没有成为论文，没有成为完整项目，也没有被系统整理成正式技术说明。现在还能留下来的，只是一些设计文档、部分代码，以及我自己的回忆。
+这套 RGB-D 标定与稀疏三维查询方案，当年没有写成论文，也没有被整理成一篇正式的技术文档。现在还能留下来的，主要只是内部设计说明、部分代码和我自己的回忆。
 
-但我仍然觉得它值得写下来。
-
-因为它代表的并不是某个小功能，而是一种我到今天仍然认可的底层视觉判断力：
+但我仍然觉得它值得写下来。  
+因为它代表的不是某一个小功能，而是一种很典型的底层视觉判断力：
 
 - 不迷信厂商 API；
-- 先把多传感器几何关系讲清楚；
-- 先选对几何观测入口；
-- 再把在线问题压缩成真正贴合任务的低维形式。
+- 先把跨传感器几何关系讲清楚；
+- 先选对几何参照物；
+- 再把在线问题压缩成真正贴合任务的形式。
 
-如果要把这篇文章压缩成一句话，我现在更愿意这样说：
+如果要把这篇文章压缩成一句话，我更愿意这样说：
 
-> **这不是一个“RGB-D 标定模块”，而是一条从几何建模出发，把跨传感器对应问题改写成任务导向稀疏几何查询问题的底层 3D 视觉路线。**
+> **这不是一个“RGB-D 标定模块”的回顾，而是一条从几何建模出发，把跨传感器点对应问题改写成任务导向稀疏查询问题的底层视觉路线。**
 
----
-
-## 附：如果要继续把它做成更完整的技术稿，还可以补什么
-
-如果以后继续整理，我认为最值得补的有四块：
-
-1. **完整符号统一**：把 RGB / D / IR 的坐标系、外参方向、深度定义统一成一个更规范的记号系统；
-2. **残差与阈值分析**：讨论 \(r(s)\) 与采样间隔、深度噪声、姿态误差之间的关系；
-3. **复杂度与成功率实验**：给出与官方 API 在少量关键点任务上的定量比较；
-4. **RGB–IR 融合路线**：把当前的单点查询扩展成更强的双目/多视恢复框架。
-
-也就是说，这个东西虽然当时只做了一周左右，后来没有继续，但它并不是一个无足轻重的小尝试。它更像是一个没被展开的底层线索：方向是对的，结构也是对的，只是当年没有继续把它推到完整形态。
+对我来说，这类东西的价值并不在于它当年有没有继续做大，而在于：它很早就证明了一件事——**只要问题写对了，很多看似笨重的视觉流程，其实可以变得非常直接。**
