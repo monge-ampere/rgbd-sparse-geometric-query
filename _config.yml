@@ -1,5 +1,4 @@
 title: RGB-D Sparse Geometric Query
+description: A low-level RGB-D vision scheme
+theme: minima
 markdown: kramdown
-kramdown:
-  input: GFM
-  math_engine: mathjax
