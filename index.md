@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: "从 RGB-D 标定到稀疏几何查询：一个未被正式写下来的 3D 视觉底层方案"
 date: 2026-04-05 20:00:00 +0800
 categories: [3d-vision, calibration, geometry]
