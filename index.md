@@ -8,6 +8,8 @@ description: "A low-level 3D vision scheme for calibration, sparse cross-sensor 
 
 **A low-level 3D vision scheme for calibration, sparse cross-sensor mapping, and lightweight 3D recovery**
 
+*冯玮（Wei Feng）*
+
 这篇文章整理的是我在 2019–2020 年前后做过的一套 RGB-D 底层视觉方案。它不是一个已经被完整整理成论文或正式产品文档的成果；它更像一个在很短时间内做出来、后来没有继续展开，但核心问题其实写对了的原型。
 
 它真正有价值的地方，不在于“做了一个 RGB-D 标定模块”，而在于它把跨传感器点对应问题，从整幅图像的通用稠密映射，改写成了一个面向少量关键点的**稀疏几何查询问题**。
@@ -446,3 +448,8 @@ $$
 > 这不是一个“RGB-D 标定模块”的回顾，而是一条从几何建模出发，把跨传感器点对应问题改写成任务导向稀疏查询问题的底层视觉路线。
 
 对我来说，这类东西的价值并不在于它当年有没有继续做大，而在于：它很早就证明了一件事——只要问题写对了，很多看似笨重的视觉流程，其实可以变得非常直接。
+
+---
+
+**作者：** 冯玮（Wei Feng）  
+**邮箱：** [weifeng@stu.ouc.edu.cn](mailto:weifeng@stu.ouc.edu.cn)
